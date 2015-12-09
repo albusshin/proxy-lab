@@ -10,21 +10,107 @@ static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64;
 static const char *connection_hdr = "Connection: close\r\n";
 static const char *proxy_connection_hdr = "Proxy-Connection: close\r\n";
 
-typedef struct proxy_info_type{
+typedef struct proxy_info_type {
     int fd;
     char *hostname;
     char *port;
     char *uri;
     rio_t *p_server_rio;
-} PI_t;
+} ProxyInfo;
+
+typedef struct cache_node_type {
+    char *absolute_uri;
+    char *content;
+    size_t size;
+    struct cache_node_type *next;
+    struct cache_node_type *prev;
+} CacheNode;
+
+CacheNode *cache_head = NULL;
+CacheNode *cache_tail = NULL;
+sem_t cache_mutex;
+
+size_t cache_size;
+
+CacheNode *find_cache_node(char *absolute_uri) {
+    P(&cache_mutex);
+    CacheNode *p = cache_head;
+    while (p) {
+        if (!strcmp(absolute_uri, p -> absolute_uri)) {
+            V(&cache_mutex);
+            return p;
+        }
+        p = p -> next;
+    }
+    V(&cache_mutex);
+    return NULL;
+}
+
+void promote(char *absolute_uri) {
+    //TODO
+}
+
+CacheNode *get_cache(char *absolute_uri) {
+    //TODO
+    P(&cache_mutex);
+    return find_cache_node(absolute_uri);
+    V(&cache_mutex);
+}
+
+void delete_cache_node(CacheNode *cache_node) {
+    P(&cache_mutex);
+    if (cache_node == cache_head) {
+        cache_head = cache_head -> next;
+    }
+    else {
+        cache_node -> prev -> next = cache_node -> next;
+    }
+    if (cache_node -> next) {
+        cache_node -> next -> prev = cache_node -> prev;
+    }
+    else {
+        /* cache_node is tail */
+        cache_tail = cache_tail -> prev;
+    }
+    V(&cache_mutex);
+    free(cache_node -> absolute_uri);
+    free(cache_node -> content);
+    free(cache_node);
+}
+
+//TODO deal with all malloc with smaller case 'm''s, and other stuff that would crash the proxy.
+void put_cache(char *absolute_uri, char *content, size_t size) {
+    CacheNode *cache_node;
+    P(&cache_mutex);
+    if ((cache_node = get_cache(absolute_uri)) != NULL) {
+        delete_cache_node(cache_node);
+    }
+
+    /* Inserting cache_node to head */
+    cache_node = malloc(sizeof(CacheNode));
+    cache_node -> next = cache_head;
+    cache_node -> prev = NULL;
+    if (cache_node -> next) {
+        cache_node -> next -> prev = cache_node;
+    }
+    else {
+        cache_tail = cache_node;
+    }
+    cache_head = cache_node;
+
+    cache_node -> absolute_uri = absolute_uri;
+    cache_node -> content = content;
+    cache_node -> size = size;
+    V(&cache_mutex);
+}
 
 /*****************Helpers*******************/
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
-void serve_proxy(PI_t *proxy_info);
+void serve_proxy(ProxyInfo *proxy_info);
 /*****************Helpers*******************/
 
-void serve_proxy(PI_t *proxy_info) {
+void serve_proxy(ProxyInfo *proxy_info) {
     rio_t rio;
     int clientfd;
     char buf[MAXLINE];
@@ -35,8 +121,6 @@ void serve_proxy(PI_t *proxy_info) {
     char *port = proxy_info -> port;
     char *uri = proxy_info -> uri;
     rio_t *p_server_rio = proxy_info -> p_server_rio;
-
-    free(proxy_info);
 
     printf("hostname: %s, port: %s\n, uri: %s\n", hostname, port, uri);
     clientfd = Open_clientfd(hostname, port);
@@ -91,19 +175,24 @@ void serve_proxy(PI_t *proxy_info) {
     Rio_writen(clientfd, (char *) proxy_connection_hdr, strlen(proxy_connection_hdr));
 	printf("%s", proxy_connection_hdr);
 
+    char *cache_content = (char *) malloc(MAX_OBJECT_SIZE);
+    char *cachep = cache_content;
+    char *cache_absolute_uri = (char *) malloc(MAXLINE);
+    // TODO use strncpys
+    // TODO try to exploit your own program! It'll be fun.
+    strncpy(cache_absolute_uri, , MAXLINE);
+
+    put_cache(
     size_t s = 0;
     while ((s = Rio_readnb(&rio, buf, MAXLINE)) && s != -1) {
         Rio_writen(fd, buf, s);
+        memcpy(cachep, buf, s);
+        cachep += s;
         Fputs(buf, stdout);
     }
 
     Fputs("Closed.", stdout);
     Close(clientfd);
-
-    free(hostname);
-    free(port);
-    free(uri);
-    free(p_server_rio);
 
     return;
 }
@@ -167,12 +256,12 @@ void doit(int fd) {
     char requestUri[MAXLINE];
     char version[MAXLINE];
 
-    char *hostname = (char *) malloc(MAXLINE);
-    char *port = (char *) malloc(MAXLINE);
-    char *uri = (char *) malloc(MAXLINE);
-    rio_t *p_server_rio = (rio_t *) malloc(sizeof(rio_t));
-    Rio_readinitb(p_server_rio, fd);
-    if (!Rio_readlineb(p_server_rio, buf, MAXLINE))
+    char hostname[MAXLINE];
+    char port[MAXLINE];
+    char uri[MAXLINE];
+    rio_t server_rio;
+    Rio_readinitb(&server_rio, fd);
+    if (!Rio_readlineb(&server_rio, buf, MAXLINE))
         return;
 
     printf("%s", buf);
@@ -185,15 +274,15 @@ void doit(int fd) {
     //TODO clean memory in each thread
     parseUri(requestUri, hostname, port, uri);
 
-    PI_t *proxy_info = malloc(sizeof(PI_t));
+    ProxyInfo proxy_info;
 
-    proxy_info -> fd = fd;
-    proxy_info -> hostname = hostname;
-    proxy_info -> port = port;
-    proxy_info -> uri = uri;
-    proxy_info -> p_server_rio = p_server_rio;
+    proxy_info.fd = fd;
+    proxy_info.hostname = hostname;
+    proxy_info.port = port;
+    proxy_info.uri = uri;
+    proxy_info.p_server_rio = &server_rio;
 
-	serve_proxy(proxy_info);
+	serve_proxy(&proxy_info);
 	Close(fd);
 }
 
