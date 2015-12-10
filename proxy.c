@@ -1,5 +1,5 @@
 /* 
- * proxy - A tiny HTTP proxy supporting only GET requests
+ * proxy.c - A tiny HTTP proxy supporting only GET requests
  *
  * Author: Tian Xin
  * Andrew ID: txin
@@ -12,10 +12,9 @@
 
 #include <stdio.h>
 #include "csapp.h"
-//TODO decouple cache into cache.h and cache.c, Makefile
+#include "cache.h"
+#include "proxylib.h"
 
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
 #define HTTP_PROTOCOL "http://"
 #define HTTP_PROTOCOL_LEN 7
 #define PORT_NUM_MIN 0
@@ -31,50 +30,14 @@ static const char *proxy_connection_hdr = "Proxy-Connection: close\r\n";
 
 /* the request information in proxy */
 typedef struct proxy_info_type {
-    int fd;
-    char *hostname;
-    char *port;
-    char *uri;
-    rio_t *p_server_rio;
+    int fd;                 /* the connection file descriptor */
+    char *hostname;         /* the requested host name */
+    char *port;             /* the requested port */
+    char *uri;              /* the requested resource URI */
+    rio_t *p_server_rio;    /* RIO wrapper of the client connection */
 } ProxyInfo;
 
-/* the cache object linked list node */
-typedef struct cache_node_type {
-    char *absolute_uri;
-    char *content;
-    size_t size;
-    time_t timestamp;
-    struct cache_node_type *next;
-    struct cache_node_type *prev;
-} CacheNode;
-
-//extern CacheNode *cache_head;       /* the cache linked list head */
-//extern size_t cache_size;           /* the current cache size */
-//extern sem_t reader_count_mutex;    /* the reader_count lock */
-//extern sem_t writer_mutex;          /* the writer semaphore */
-//extern int reader_count;            /* the current reader count */
-CacheNode *cache_head;       /* the cache linked list head */
-size_t cache_size = 0;      /* the current cache size */
-sem_t reader_count_mutex;   /* the reader_count lock */
-sem_t writer_mutex;         /* the writer semaphore */
-int reader_count = 0;       /* the current reader count */
-
 /* function declarations */
-
-/* error helpers */
-void gai_error_non_exit(int code, char *msg);
-void unix_error_non_exit(char *msg);
-void posix_error_non_exit(int code, char *msg);
-
-/* rio wrappers */
-ssize_t proxy_rio_readnb(rio_t *rp, void *usrbuf, size_t n);
-ssize_t proxy_rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen);
-int proxy_rio_writen(int fd, void *usrbuf, size_t n);
-
-/* client error response functions */
-void clienterror(int fd, char *cause, char *errnum, 
-		 char *shortmsg, char *longmsg);
-void internal_server_error(int fd);
 
 /* proxy core functions */
 void serve_proxy(ProxyInfo *proxy_info);
@@ -82,18 +45,10 @@ void parse_uri(char *request_uri, char *hostname, char *port, char *uri);
 void doit(int fd);
 void *handle_request_thread(void *p_fd);
 
-/* cache functions */
-CacheNode *find_cache_node(char *absolute_uri);
-void delete_cache_node(CacheNode *cache_node);
-void evict_cache();
-CacheNode *get_cache(char *absolute_uri);
-void put_cache(char *absolute_uri, char *content, size_t size);
-
 /* signal handler */
 void sigpipe_handler(int sig);
 
 /* end function declarations */
-
 
 /* main - the main routine for the proxy */
 int
@@ -105,10 +60,7 @@ main(int argc, char **argv) {
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
 
-    /* set reader_count_mutex = 1 */
-    V(&reader_count_mutex);
-    /* set writer_mutex = 1 */
-    V(&writer_mutex);
+    init_cache();
     pthread_t tid;
 
     /* Check command line args */
@@ -196,8 +148,6 @@ void serve_proxy(ProxyInfo *proxy_info) {
 
     if ((cache_node = get_cache(cache_absolute_uri)) != NULL) {
         /* cache hit, return the result directly */
-        printf("Cache hit, time: %lu\n", 
-                (unsigned long) cache_node -> timestamp);
         proxy_rio_writen(fd, cache_node -> content, cache_node -> size);
         return;
     }
@@ -212,6 +162,7 @@ void serve_proxy(ProxyInfo *proxy_info) {
 
     /* trasmit first line of request */
     snprintf(buf, MAXLINE, "GET %s HTTP/1.0\r\n", uri);
+    
     proxy_rio_writen(clientfd, buf, strlen(buf));
 
     /* read request headers */
@@ -240,8 +191,9 @@ void serve_proxy(ProxyInfo *proxy_info) {
                 continue;
             }
         }
-        /* write client request to server */
-        proxy_rio_writen(clientfd, buf, strlen(buf));
+        if (strcmp(buf, "\r\n")) {
+            proxy_rio_writen(clientfd, buf, strlen(buf));
+        }
     }
     /* write host-header */
     if (!host_set) {
@@ -253,7 +205,9 @@ void serve_proxy(ProxyInfo *proxy_info) {
     /* write connection header */
     proxy_rio_writen(clientfd, (char *) connection_hdr, strlen(connection_hdr));
     /* write proxy-connection header */
-    proxy_rio_writen(clientfd, (char *) proxy_connection_hdr, strlen(proxy_connection_hdr));
+    proxy_rio_writen(clientfd, 
+            (char *) proxy_connection_hdr, strlen(proxy_connection_hdr));
+    proxy_rio_writen(clientfd, "\r\n", 2);
 
     char *cache_content;
     if ((cache_content = (char *) malloc(MAX_OBJECT_SIZE)) == NULL) {
@@ -561,7 +515,6 @@ void internal_server_error(int fd) {
                 "The proxy server encountered a problem");
 }
 
-
 /*
  * handle_request_thread - the thread function
  */
@@ -577,145 +530,3 @@ void *handle_request_thread(void *p_fd) {
     return NULL;
 }
 
-/*
- * find_cache_node - 
- *      a helper to find the cache object node
- *      inside the cache linked list with absolute_uri
- */
-CacheNode *find_cache_node(char *absolute_uri) {
-    CacheNode *p = cache_head;
-    while (p) {
-        if (!strncmp(absolute_uri, p -> absolute_uri, MAXLINE)) {
-            return p;
-        }
-        p = p -> next;
-    }
-    return NULL;
-}
-
-/*
- * delete_cache_node -
- *      a helper to delete the cache object node from the cache linked list
- */
-void delete_cache_node(CacheNode *cache_node) {
-    if (cache_node == cache_head) {
-        cache_head = cache_head -> next;
-    }
-    else {
-        cache_node -> prev -> next = cache_node -> next;
-    }
-    if (cache_node -> next) {
-        cache_node -> next -> prev = cache_node -> prev;
-    }
-    free(cache_node -> absolute_uri);
-    free(cache_node -> content);
-    free(cache_node);
-}
-
-/*
- * evict_cache -
- *      cache evict method
- *      Delete the oldest cache object node from the cache.
- */
-void evict_cache() {
-    CacheNode *p, *to_evict = cache_head;
-    /* find the oldest cache object node */
-    for (p = cache_head; p; p = p -> next) {
-        /* Because the timestamp is measured in seconds, there might be
-         * many nodes with the same timestamps. We want to evict the oldest
-         * object, and because when putting into cache we put the new cache
-         * object node in the head of the linked list, the rightmost node with 
-         * the same timestamp value is the oldest one */
-        if (p -> timestamp <= to_evict -> timestamp) {
-            to_evict = p;
-        }
-    }
-    /* log to console about eviction */
-    printf("Cache evict, timestamp:%lu\n", 
-            (unsigned long) to_evict -> timestamp);
-    /* deduct the current cache size */
-    /* only writer can do evictions, and only one writer can write */
-    /* so no need to lock the cache_size variable */
-    cache_size -= to_evict -> size;
-    /* delete the cache object node from the linked list */
-    delete_cache_node(to_evict);
-}
-
-/*
- * get_cache - 
- *      cache get method
- *      Read the cache object with the provided absolute_uri.
- */
-CacheNode *get_cache(char *absolute_uri) {
-    /* lock before updating reader_count */
-    P(&reader_count_mutex);
-    reader_count++;
-    if (reader_count == 1) { /* First reader in, lock writers */
-        P(&writer_mutex);
-    }
-    V(&reader_count_mutex);
-
-    CacheNode * ret = find_cache_node(absolute_uri);
-    if (ret) {
-        /* updating the last used timestamp on the cache object */
-        ret -> timestamp = time(NULL);
-    }
-
-    /* lock before updating reader_count */
-    P(&reader_count_mutex);
-    reader_count--;
-    if (reader_count == 0) { /* Last reader out, unlock writers */
-        V(&writer_mutex);
-    }
-    V(&reader_count_mutex);
-    return ret;
-}
-
-/*
- * put_cache -
- *      cache put method
- *      Write a new cache object with the provided information.
- *      If the cache is full, evict cache nodes until the room is
- *      large enough to store the new cache object node.
- */
-void put_cache(char *absolute_uri, char *content, size_t size) {
-    /* acquire writer lock */
-    P(&writer_mutex);
-    cache_size += size;
-    /* if total size is larger than the max cache size,
-     * do cache evictions until this object can be stored in the cache */
-    while (cache_size > MAX_CACHE_SIZE) {
-        evict_cache();
-    }
-    CacheNode *cache_node;
-    if ((cache_node = find_cache_node(absolute_uri)) != NULL) {
-        /* if there exists an cache node with the same aboslute_uri 
-         * delete the old cache object and update it using the new one*/
-        delete_cache_node(cache_node);
-    }
-
-    /* inserting cache_node to head */
-    if ((cache_node = (CacheNode *) malloc(sizeof(CacheNode))) == NULL) {
-        /* if malloc for the cachenode fails, give up and return
-         * without exiting the program */
-        unix_error_non_exit("malloc for cache error");
-        V(&writer_mutex);
-        return;
-    }
-    /* set the time info */
-    cache_node -> timestamp = time(NULL);
-    /* cleaning up pointers */
-    cache_node -> next = cache_head;
-    cache_node -> prev = NULL;
-    if (cache_node -> next) {
-        cache_node -> next -> prev = cache_node;
-    }
-    cache_head = cache_node;
-
-    /* set the actual content and absolute_uri for the cache node */
-    cache_node -> absolute_uri = absolute_uri;
-    cache_node -> content = content;
-    cache_node -> size = size;
-    /* release writer lock */
-    V(&writer_mutex);
-}
